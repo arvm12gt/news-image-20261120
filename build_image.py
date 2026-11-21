@@ -1,222 +1,251 @@
 #!/usr/bin/env python3
-"""Render entry.png (1024x1024): an editorial front-page poster that sums up
-20 November 2026 world news in one image -- a lead story, four panels, and a
-dense 37-item sourced wire section (42 stories in total, date-checked).
-Everything is drawn in code with Pillow -- crisp vector-style shapes and real
-rendered text, so every headline stays legible (unlike AI-generated images).
-Run:  python3 build_image.py   ->  writes entry.png here (and /output).
-Deterministic: same input always produces byte-identical output.
+"""Paint the 20 November 2026 front page: THE WORLD IN ONE IMAGE.
+
+One 1024x1024 PNG, drawn entirely by this script with Pillow -- no
+generated pictures, no network, no fonts beyond the DejaVu faces that
+ship with the system. The page carries 42 sourced stories from Friday
+20 November 2026: the Russian barrage of Kyiv's bridges spilling into
+Poland leads, four panels cover the Gulf blockade, the AI selloff,
+the COP31 deadlock and Trump's return from Shenzhen, and a three-column
+wire ("THE DAY IN BRIEF") holds the other 37. A date-check box stamps
+the day on the masthead so the picture can never be mistaken for
+another day's news.
+
+Run it with:  python3 build_image.py
+It writes entry.png next to this file and a copy to /output/entry.png.
+The output is deterministic: run it twice, the bytes match.
 """
 
-import glob
 import math
 import os
+
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = "/output"
-OUT = os.path.join(OUT_DIR, "entry.png")
-LOCAL = os.path.join(HERE, "entry.png")
-
-W = H = 1024
-PAPER = (247, 242, 231)   # #f7f2e7
-INK = (25, 25, 34)        # #191922
-RED = (179, 49, 42)       # #b3312a
-NAVY = (20, 64, 107)      # #14406b
-GOLD = (201, 162, 39)     # #c9a227
-SMOKE = (150, 144, 128)
-WHITE = (255, 255, 255)
-TEAL = (31, 110, 96)      # #1f6e60
-
+SIDE = 1024
 MARGIN = 44
-CONTENT_W = W - 2 * MARGIN  # 936
+SPAN = SIDE - 2 * MARGIN          # 936, the width of the live area
 
+# The palette: newsprint cream, near-black ink, and four signal colours.
+CREAM = (247, 242, 231)
+INK = (25, 25, 34)
+SIGNAL_RED = (179, 49, 42)
+DEEP_BLUE = (20, 64, 107)
+BRASS = (201, 162, 39)
+HAZE = (150, 144, 128)
+SNOW = (255, 255, 255)
+PINE = (31, 110, 96)
 
-# ---------------------------------------------------------------- fonts ----
-def find_font(*patterns):
-    for pat in patterns:
-        hits = sorted(glob.glob(pat))
-        if hits:
-            return hits[0]
-    raise FileNotFoundError(patterns)
-
-
-BOLD_PATH = find_font(
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/**/NotoSans-Bold.ttf",
-    "/usr/share/fonts/**/LiberationSans-Bold.ttf",
-)
-REG_PATH = find_font(
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/**/NotoSans-Regular.ttf",
-    "/usr/share/fonts/**/LiberationSans-Regular.ttf",
+FONT_DIRS = (
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/noto",
 )
 
-_cache = {}
+
+class Type:
+    """Font lookup with a small cache; measures with the font itself."""
+
+    def __init__(self):
+        self._fonts = {}
+        self._paths = {}
+
+    def _locate(self, heavy):
+        if heavy in self._paths:
+            return self._paths[heavy]
+        wanted = "DejaVuSans-Bold.ttf" if heavy else "DejaVuSans.ttf"
+        for folder in FONT_DIRS:
+            candidate = os.path.join(folder, wanted)
+            if os.path.exists(candidate):
+                self._paths[heavy] = candidate
+                return candidate
+        # Fall back to whatever bold/regular face the system offers.
+        for folder in FONT_DIRS:
+            for name in sorted(os.listdir(folder)):
+                if name.endswith(".ttf") and ("Bold" in name) == heavy:
+                    found = os.path.join(folder, name)
+                    self._paths[heavy] = found
+                    return found
+        raise FileNotFoundError(wanted)
+
+    def face(self, heavy, size):
+        key = (heavy, size)
+        if key not in self._fonts:
+            self._fonts[key] = ImageFont.truetype(self._locate(heavy), size)
+        return self._fonts[key]
+
+    @staticmethod
+    def measure(text, face):
+        return face.getlength(text)
 
 
-def font(path, size):
-    key = (path, size)
-    if key not in _cache:
-        _cache[key] = ImageFont.truetype(path, size)
-    return _cache[key]
+def wrap_lines(text, face, max_w):
+    """Yield word-wrapped lines measured with the real font metrics."""
+    words = text.split()
+    current = ""
+    for word in words:
+        trial = word if not current else current + " " + word
+        if face.getlength(trial) <= max_w:
+            current = trial
+            continue
+        if current:
+            yield current
+        current = word
+    if current:
+        yield current
 
 
-def bold(size):
-    return font(BOLD_PATH, size)
+def fit_text(ty, text, heavy, top_size, floor_size, max_w, max_h,
+             leading=1.18, limit=None):
+    """Step the size down until the wrapped text fits the box.
 
-
-def regular(size):
-    return font(REG_PATH, size)
-
-
-# ------------------------------------------------------------ text utils ----
-_probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
-
-
-def text_w(text, fnt):
-    return _probe.textlength(text, font=fnt)
-
-
-def wrap(text, fnt, max_w):
-    """Greedy word wrap measured with the real font metrics."""
-    lines, cur = [], ""
-    for word in text.split():
-        trial = word if not cur else cur + " " + word
-        if text_w(trial, fnt) <= max_w:
-            cur = trial
-        else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-def fit_block(text, path, start, minimum, max_w, max_h, lh_factor=1.18,
-              max_lines=None):
-    """Shrink the font until the wrapped block fits the box.
-
-    Returns (font, lines, line_height, total_height)."""
-    size = start
-    while size >= minimum:
-        fnt = font(path, size)
-        lines = wrap(text, fnt, max_w)
-        lh = int(size * lh_factor)
-        total = lh * len(lines)
-        if total <= max_h and (max_lines is None or len(lines) <= max_lines):
-            return fnt, lines, lh, total
+    Returns (face, lines, line_height)."""
+    size = top_size
+    while True:
+        face = ty.face(heavy, size)
+        lines = list(wrap_lines(text, face, max_w))
+        step = max(1, round(size * leading))
+        fits = step * len(lines) <= max_h
+        if limit is not None:
+            fits = fits and len(lines) <= limit
+        if fits or size <= floor_size:
+            return face, lines, step
         size -= 1
-    fnt = font(path, minimum)
-    lines = wrap(text, fnt, max_w)
-    lh = int(minimum * lh_factor)
-    return fnt, lines, lh, lh * len(lines)
 
 
-def draw_lines(d, x, y, lines, fnt, lh, fill, align="left", box_w=None):
-    for line in lines:
-        if align == "center":
-            lx = x + (box_w - text_w(line, fnt)) / 2
-        else:
+class Poster:
+    """A drawing surface that tracks its own vertical cursor."""
+
+    def __init__(self):
+        self.img = Image.new("RGB", (SIDE, SIDE), CREAM)
+        self.d = ImageDraw.Draw(self.img)
+        self.ty = Type()
+        self.checks = []
+
+    def record(self, label, box_h, used_h, lines=None):
+        self.checks.append((label, box_h, used_h, lines))
+
+    def text(self, x, y, s, face, colour):
+        self.d.text((x, y), s, font=face, fill=colour)
+
+    def block(self, x, y, lines, face, step, colour, centre=None):
+        """Draw wrapped lines; centre them inside `centre` when given."""
+        for line in lines:
             lx = x
-        d.text((lx, y), line, font=fnt, fill=fill)
-        y += lh
-    return y
+            if centre is not None:
+                lx = x + (centre - self.ty.measure(line, face)) / 2
+            self.d.text((lx, y), line, font=face, fill=colour)
+            y += step
+        return y
 
+    def caps(self, x, y, s, face, colour, gap=4):
+        """Letterspaced capitals, as newspaper kickers are set."""
+        cursor = x
+        for ch in s:
+            self.d.text((cursor, y), ch, font=face, fill=colour)
+            cursor += self.ty.measure(ch, face) + gap
+        return cursor - gap
 
-def draw_tracked(d, x, y, text, fnt, fill, tracking=3):
-    """Draw letterspaced caps (for kickers); returns the end x."""
-    cx = x
-    for ch in text:
-        d.text((cx, y), ch, font=fnt, fill=fill)
-        cx += text_w(ch, fnt) + tracking
-    return cx - tracking
+    def rule(self, y, weight=2, colour=INK, x0=None, x1=None):
+        self.d.rectangle([x0 or MARGIN, y, x1 or (SIDE - MARGIN),
+                          y + weight], fill=colour)
 
-
-REPORT = []
-
-
-def note(name, box, used_h, lines=None):
-    REPORT.append((name, box, used_h, lines))
+    def save(self):
+        os.makedirs("/output", exist_ok=True)
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "entry.png")
+        self.img.save("/output/entry.png", format="PNG", optimize=True)
+        self.img.save(here, format="PNG", optimize=True)
+        n = os.path.getsize("/output/entry.png")
+        print(f"saved /output/entry.png: {SIDE}x{SIDE}, {n} bytes")
+        print("--- layout measurements (box -> used) ---")
+        for label, box_h, used_h, lines in self.checks:
+            flag = "OK " if used_h <= box_h else "OVERFLOW"
+            print(f"{flag} {label}: box h={box_h} used h={used_h} "
+                  f"lines={lines}")
 
 
 # ------------------------------------------------------------- pictograms ----
-def pic_bridges(d, x, y, w, h):
-    """Kyiv under barrage: three Dnipro bridges, missile streaks, blasts."""
+# Each one is a small vector vignette for a story: bridges under fire,
+# a tanker among mines, a plunging market, a warming globe, three flags.
+
+def draw_kyiv(p, x, y, w, h):
+    """Kyiv under barrage: skyline, three river bridges, diving missiles."""
+    d = p.d
     base = y + h
-    # river band at the bottom
-    d.rectangle([x, base - 14, x + w, base - 8], fill=TEAL)
-    d.rectangle([x, base - 6, x + w, base], fill=NAVY)
-    # three bridge decks with arches, one deck broken in the middle
-    for i, fx in enumerate((0.14, 0.50, 0.86)):
+    # skyline silhouette behind the bridges
+    for i, (fx, fh) in enumerate(((0.03, 0.34), (0.10, 0.52), (0.18, 0.40),
+                                  (0.62, 0.44), (0.70, 0.58), (0.79, 0.36),
+                                  (0.88, 0.48))):
+        bw = w * 0.06
+        bx = x + w * fx
+        d.rectangle([bx, base - h * fh - 30, bx + bw, base - 30], fill=HAZE)
+    # the river: two bands at the foot
+    d.rectangle([x, base - 12, x + w, base - 7], fill=PINE)
+    d.rectangle([x, base - 5, x + w, base], fill=DEEP_BLUE)
+    # three bridge decks; the middle one is broken by a blast
+    for i, fx in enumerate((0.16, 0.50, 0.84)):
         cx = x + w * fx
-        bw = w * 0.24
-        d.rectangle([cx - bw / 2, base - 34, cx + bw / 2, base - 26],
-                    fill=INK)
-        d.arc([cx - bw / 2, base - 52, cx + bw / 2, base - 22], start=180,
-              end=360, fill=NAVY, width=4)
+        half = w * 0.115
+        d.rectangle([cx - half, base - 32, cx + half, base - 25], fill=INK)
+        d.arc([cx - half, base - 46, cx + half, base - 18], 180, 360,
+              fill=DEEP_BLUE, width=4)
         if i == 1:
-            # broken middle deck: a gap with a smoke plume
-            d.rectangle([cx - 8, base - 34, cx + 8, base - 26], fill=PAPER)
+            d.rectangle([cx - 9, base - 32, cx + 9, base - 25], fill=CREAM)
             for j in range(4):
                 t = j / 3.0
-                px = cx + 6 * t
-                py = base - 40 - 14 * t
+                px = cx + 7 * t
+                py = base - 38 - 15 * t
                 r = 4 + 5 * t
-                d.ellipse([px - r, py - r, px + r, py + r], fill=SMOKE)
-    # missile streaks diving from the top corners
-    for (sx, sy, ex, ey) in ((0.06, 0.02, 0.30, 0.42),
-                             (0.94, 0.02, 0.70, 0.42),
-                             (0.52, 0.00, 0.50, 0.30)):
-        d.line([x + w * sx, y + h * sy, x + w * ex, y + h * ey], fill=RED,
-               width=4)
-        d.ellipse([x + w * ex - 5, y + h * ey - 5, x + w * ex + 5,
-                   y + h * ey + 5], fill=GOLD, outline=RED, width=2)
-    # blast star over the middle bridge
-    cx, cy = x + w * 0.50, y + h * 0.52
-    star = []
-    for i in range(16):
-        r = h * (0.20 if i % 2 == 0 else 0.09)
-        a = -math.pi / 2 + i * math.pi / 8
-        star.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    d.polygon(star, fill=GOLD)
-    star2 = []
-    for i in range(12):
-        r = h * (0.11 if i % 2 == 0 else 0.05)
-        a = -math.pi / 2 + i * math.pi / 6
-        star2.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    d.polygon(star2, fill=RED)
+                d.ellipse([px - r, py - r, px + r, py + r], fill=HAZE)
+    # missiles diving in from the top corners, warheads glowing
+    for (sx, ex) in ((0.05, 0.28), (0.95, 0.72)):
+        d.line([x + w * sx, y + 2, x + w * ex, y + h * 0.42],
+               fill=SIGNAL_RED, width=4)
+        d.ellipse([x + w * ex - 5, y + h * 0.42 - 5, x + w * ex + 5,
+                   y + h * 0.42 + 5], fill=BRASS, outline=SIGNAL_RED,
+                  width=2)
+    # blast star over the broken span
+    cx, cy = x + w * 0.50, y + h * 0.50
+    for outer, inner, colour in ((0.20, 0.09, BRASS), (0.11, 0.05,
+                                                       SIGNAL_RED)):
+        pts = []
+        for i in range(16):
+            r = h * (outer if i % 2 == 0 else inner)
+            a = -math.pi / 2 + i * math.pi / 8
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        d.polygon(pts, fill=colour)
 
 
-def pic_tanker(d, x, y, s):
-    """Oil tanker on waves with a burst of flame and mine dots."""
-    for i, yy in enumerate((0.72, 0.82, 0.92)):
-        col = NAVY if i % 2 == 0 else TEAL
-        d.rectangle([x, y + s * yy, x + s, y + s * (yy + 0.06)], fill=col)
-    d.polygon([(x + s * 0.08, y + s * 0.62), (x + s * 0.92, y + s * 0.62),
-               (x + s * 0.84, y + s * 0.74), (x + s * 0.16, y + s * 0.74)],
+def draw_tanker(p, x, y, s):
+    """A tanker on a mined strait, one hold on fire."""
+    d = p.d
+    # three wave bands
+    for i, frac in enumerate((0.74, 0.83, 0.92)):
+        colour = DEEP_BLUE if i % 2 == 0 else PINE
+        d.rectangle([x, y + s * frac, x + s, y + s * (frac + 0.05)],
+                    fill=colour)
+    # hull: a flat-bottomed trapezoid, deck tanks as white drums
+    d.polygon([(x + s * 0.06, y + s * 0.63), (x + s * 0.94, y + s * 0.63),
+               (x + s * 0.86, y + s * 0.75), (x + s * 0.14, y + s * 0.75)],
               fill=INK)
-    for f in (0.24, 0.44, 0.64):
-        cx = x + s * f
-        d.ellipse([cx - 13, y + s * 0.50, cx + 13, y + s * 0.62], fill=WHITE,
+    for frac in (0.26, 0.46, 0.66):
+        cx = x + s * frac
+        d.ellipse([cx - 12, y + s * 0.52, cx + 12, y + s * 0.63], fill=SNOW,
                   outline=INK, width=3)
-    d.rectangle([x + s * 0.78, y + s * 0.44, x + s * 0.88, y + s * 0.62],
-                fill=RED)
-    cx, cy = x + s * 0.20, y + s * 0.30
-    star = []
-    for i in range(16):
-        r = s * (0.24 if i % 2 == 0 else 0.11)
-        a = -math.pi / 2 + i * math.pi / 8
-        star.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    d.polygon(star, fill=GOLD)
-    star2 = []
-    for i in range(12):
-        r = s * (0.13 if i % 2 == 0 else 0.06)
-        a = -math.pi / 2 + i * math.pi / 6
-        star2.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    d.polygon(star2, fill=RED)
-    for fx, fy in ((0.68, 0.86), (0.86, 0.80)):
+    d.rectangle([x + s * 0.80, y + s * 0.46, x + s * 0.89, y + s * 0.63],
+                fill=SIGNAL_RED)
+    # fire over the forward hold: a gold star with a red heart
+    cx, cy = x + s * 0.22, y + s * 0.32
+    for outer, inner, colour in ((0.23, 0.10, BRASS), (0.12, 0.05,
+                                                       SIGNAL_RED)):
+        pts = []
+        for i in range(16):
+            r = s * (outer if i % 2 == 0 else inner)
+            a = -math.pi / 2 + i * math.pi / 8
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        d.polygon(pts, fill=colour)
+    # two spiked mines drifting to starboard
+    for fx, fy in ((0.70, 0.87), (0.88, 0.81)):
         mx, my = x + s * fx, y + s * fy
         d.ellipse([mx - 7, my - 7, mx + 7, my + 7], fill=INK)
         for ang in range(0, 360, 45):
@@ -226,49 +255,48 @@ def pic_tanker(d, x, y, s):
                    fill=INK, width=2)
 
 
-def pic_chart(d, x, y, s):
-    """Falling market chart: descending bars and a plunging red line."""
-    # axis
-    d.line([x + 6, y + s * 0.10, x + 6, y + s * 0.88], fill=INK, width=3)
+def draw_market(p, x, y, s):
+    """A market in free fall: shrinking bars, a plunging gold line."""
+    d = p.d
+    # axes
+    d.line([x + 6, y + s * 0.08, x + 6, y + s * 0.88], fill=INK, width=3)
     d.line([x + 6, y + s * 0.88, x + s - 4, y + s * 0.88], fill=INK, width=3)
-    # descending bars, navy to red
+    # six bars, tall on the left, cut down on the right
     n = 6
-    bw = (s - 22) / n
-    heights = (0.30, 0.38, 0.46, 0.55, 0.66, 0.78)
-    for i, hf in enumerate(heights):
-        bx = x + 10 + i * bw
-        top = y + s * 0.88 - s * hf * 0.82
-        col = NAVY if i < 3 else RED
-        d.rectangle([bx, top, bx + bw - 5, y + s * 0.88], fill=col)
-    # plunging line across the bar tops
-    pts = []
-    for i, hf in enumerate(heights):
-        px = x + 10 + i * bw + (bw - 5) / 2
-        py = y + s * 0.88 - s * hf * 0.82 - 4
-        pts.append((px, py))
-    d.line(pts, fill=GOLD, width=4, joint="curve")
-    # arrowhead at the end, pointing down
-    ex, ey = pts[-1]
+    step = (s - 22) / n
+    tops = []
+    for i in range(n):
+        frac = (0.30, 0.38, 0.46, 0.55, 0.66, 0.78)[i]
+        bx = x + 10 + i * step
+        top = y + s * 0.88 - s * frac * 0.82
+        colour = DEEP_BLUE if i < 3 else SIGNAL_RED
+        d.rectangle([bx, top, bx + step - 5, y + s * 0.88], fill=colour)
+        tops.append((bx + (step - 5) / 2, top - 4))
+    # the gold line joins the bar tops, ending in a down arrow
+    d.line(tops, fill=BRASS, width=4, joint="curve")
+    ex, ey = tops[-1]
     d.polygon([(ex - 8, ey - 2), (ex + 2, ey - 10), (ex + 8, ey + 4)],
-              fill=GOLD)
+              fill=BRASS)
 
 
-def pic_climate(d, x, y, s):
-    """A warming globe under a factory smokestack plume."""
-    cx, cy = x + s * 0.42, y + s * 0.58
+def draw_climate(p, x, y, s):
+    """A warming globe beside a smoking chimney."""
+    d = p.d
+    cx, cy = x + s * 0.40, y + s * 0.58
     r = s * 0.30
-    # globe
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=TEAL, outline=INK,
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=PINE, outline=INK,
               width=3)
-    d.arc([cx - r, cy - r, cx + r, cy + r], start=90, end=270, fill=NAVY,
-          width=3)
-    # landmass blobs
-    d.ellipse([cx - r * 0.55, cy - r * 0.55, cx + r * 0.05, cy - r * 0.05],
-              fill=GOLD)
-    d.ellipse([cx - r * 0.05, cy + r * 0.10, cx + r * 0.55, cy + r * 0.55],
-              fill=GOLD)
-    # smokestack on the right, smoke curling up
-    sx = x + s * 0.78
+    # meridians: two arcs across the disc
+    d.arc([cx - r, cy - r, cx + r, cy + r], 90, 270, fill=DEEP_BLUE, width=3)
+    d.arc([cx - r * 0.55, cy - r, cx + r * 0.55, cy + r], 90, 270,
+          fill=DEEP_BLUE, width=2)
+    # land in brass: one blob north-west, one south-east
+    d.ellipse([cx - r * 0.60, cy - r * 0.60, cx + r * 0.02, cy - r * 0.08],
+              fill=BRASS)
+    d.ellipse([cx - r * 0.05, cy + r * 0.08, cx + r * 0.58, cy + r * 0.55],
+              fill=BRASS)
+    # chimney on the right, smoke curling up and away
+    sx = x + s * 0.80
     d.polygon([(sx - 8, y + s * 0.95), (sx + 8, y + s * 0.95),
                (sx + 6, y + s * 0.45), (sx - 6, y + s * 0.45)], fill=INK)
     for i in range(4):
@@ -276,36 +304,36 @@ def pic_climate(d, x, y, s):
         px = sx + 8 * t
         py = y + s * (0.40 - 0.10 * t)
         rr = 5 + 6 * t
-        d.ellipse([px - rr, py - rr, px + rr, py + rr], fill=SMOKE)
-    # thermometer sliver at the bottom left
-    d.rectangle([x + 4, y + s * 0.86, x + s * 0.30, y + s * 0.92], fill=RED)
+        d.ellipse([px - rr, py - rr, px + rr, py + rr], fill=HAZE)
+    # a red thermometer tick at the foot
+    d.rectangle([x + 4, y + s * 0.86, x + s * 0.30, y + s * 0.92],
+                fill=SIGNAL_RED)
 
 
-def pic_flags(d, x, y, s):
-    """Three flag poles over a summit table band (diplomacy).
-
-    All geometry is relative to s so the flags stay inside the box
-    at panel size (68px) as well as at full width."""
+def draw_flags(p, x, y, s):
+    """Three flags over a summit table: the diplomacy vignette."""
+    d = p.d
     base = y + s
-    d.rectangle([x, base - 24, x + s, base - 20], fill=GOLD)
+    d.rectangle([x, base - 24, x + s, base - 20], fill=BRASS)
     d.rectangle([x, base - 18, x + s, base - 6], fill=INK)
-    d.rectangle([x, base - 4, x + s, base], fill=NAVY)
+    d.rectangle([x, base - 4, x + s, base], fill=DEEP_BLUE)
     fw, fh = s * 0.26, s * 0.16
-    for i, col in enumerate((RED, NAVY, GOLD)):
+    for i, colour in enumerate((SIGNAL_RED, DEEP_BLUE, BRASS)):
         px = x + s * (0.06 + 0.30 * i)
         top = y + 4 + (8 if i == 1 else 0)
         d.line([px, top, px, base - 18], fill=INK, width=5)
-        d.polygon([(px, top), (px + fw, top + 4), (px + fw - 8, top + fh / 2),
-                   (px + fw, top + fh - 4), (px, top + fh)], fill=col,
-                  outline=INK)
-        d.ellipse([px - 4, top - 5, px + 4, top + 3], fill=GOLD)
+        d.polygon([(px, top), (px + fw, top + 4),
+                   (px + fw - 8, top + fh / 2), (px + fw, top + fh - 4),
+                   (px, top + fh)], fill=colour, outline=INK)
+        d.ellipse([px - 4, top - 5, px + 4, top + 3], fill=BRASS)
 
 
 # ------------------------------------------------------------- wire items ----
-# 37 one-line stories for "THE DAY IN BRIEF": every item is dated
-# 20 November 2026 in its source (Standard Topic world archive, Moneycontrol,
-# Morningstar/Dow Jones, TradersView, fincazelda.eu / 4designers.eu wires).
-# Tags are the reporting outlet or agency behind each item.
+# 37 one-line stories for "THE DAY IN BRIEF". Every item is dated
+# 20 November 2026 in its source (Standard Topic's world archive,
+# Moneycontrol, Morningstar/Dow Jones, TradersView and the wire services
+# behind the fincazelda.eu / 4designers.eu aggregations). The tag names
+# the outlet or agency that reported it.
 WIRE = [
     ("IEA", "HORMUZ DISRUPTION LARGEST ENERGY SHOCK ON RECORD"),
     ("REUTERS", "OIL PRICES SWING AS TANKER ATTACKS ROIL SUPPLY OUTLOOK"),
@@ -348,206 +376,171 @@ WIRE = [
 ]
 
 
-def wire_wrap(headline, tag, fnt, col_w, tag_fnt=None):
-    """Wrap a wire headline with a red tag prefix on the first line.
-
-    Headline is set in fnt (regular), the tag in tag_fnt (bold).
-    Returns (lines, tag_width, tag)."""
-    tag_w = text_w(tag, tag_fnt or fnt) + 8
-    lines, cur, avail = [], "", col_w - tag_w
+def wrap_wire(headline, tag, face, tag_face, col_w):
+    """Wrap one wire headline; the tag rides on its first line."""
+    tag_w = tag_face.getlength(tag) + 8
+    lines, current, room = [], "", col_w - tag_w
     for word in headline.split():
-        trial = word if not cur else cur + " " + word
-        if text_w(trial, fnt) <= avail:
-            cur = trial
+        trial = word if not current else current + " " + word
+        if face.getlength(trial) <= room:
+            current = trial
         else:
-            lines.append(cur)
-            cur, avail = word, col_w
-    if cur:
-        lines.append(cur)
+            lines.append(current)
+            current, room = word, col_w
+    if current:
+        lines.append(current)
     return lines, tag_w, tag
 
 
-# ----------------------------------------------------------------- layout ----
-def main():
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
+# ------------------------------------------------------------------ build ----
+def build():
+    p = Poster()
+    d, ty = p.d, p.ty
 
-    # ---- masthead ----
-    f_title, t_lines, t_lh, t_h = fit_block(
-        "THE WORLD IN ONE IMAGE", BOLD_PATH, 52, 40, CONTENT_W, 58,
-        lh_factor=1.0, max_lines=1)
-    draw_lines(d, MARGIN, 8, t_lines, f_title, t_lh, INK,
-               align="center", box_w=CONTENT_W)
-    note("masthead title", (MARGIN, 8, CONTENT_W, 58), t_h, t_lines)
+    # ---- masthead: title, date line, date-check box ----
+    face, lines, step = fit_text(ty, "THE WORLD IN ONE IMAGE", True, 52,
+                                 40, SPAN, 58, leading=1.0, limit=1)
+    p.block(MARGIN, 8, lines, face, step, INK, centre=SPAN)
+    p.record("masthead title", 58, step * len(lines), lines)
 
-    date_f = regular(20)
-    date_txt = "FRIDAY · 20 NOVEMBER 2026 · 42 STORIES · SOURCED"
-    d.text((MARGIN, 66), date_txt, font=date_f, fill=NAVY)
+    p.text(MARGIN, 66, "FRIDAY · 20 NOVEMBER 2026 · 42 STORIES · SOURCED",
+           ty.face(False, 20), DEEP_BLUE)
 
-    # date-check corner box (right of the date line)
-    bx0, by0, bx1, by1 = W - MARGIN - 210, 58, W - MARGIN, 94
-    d.rectangle([bx0, by0, bx1, by1], outline=RED, width=3)
-    dc1, dc2 = bold(15), bold(13)
-    t1, t2 = "DATE CHECK ✓", "FRI 20 NOV 2026"
-    d.text(((bx0 + bx1 - text_w(t1, dc1)) / 2, by0 + 3), t1, font=dc1,
-           fill=RED)
-    d.text(((bx0 + bx1 - text_w(t2, dc2)) / 2, by0 + 19), t2, font=dc2,
-           fill=INK)
-    note("date-check box", (bx0, by0, 210, 36), 36, [t1, t2])
+    bx0, bx1 = SIDE - MARGIN - 210, SIDE - MARGIN
+    d.rectangle([bx0, 58, bx1, 94], outline=SIGNAL_RED, width=3)
+    for txt, size, colour, dy in (("DATE CHECK ✓", 15, SIGNAL_RED, 3),
+                                  ("FRI 20 NOV 2026", 13, INK, 19)):
+        f = ty.face(True, size)
+        p.text((bx0 + bx1 - ty.measure(txt, f)) / 2, 58 + dy, txt, f,
+               colour)
+    p.record("date-check box", 36, 36, ["DATE CHECK ✓", "FRI 20 NOV 2026"])
 
-    # thin double rules
-    d.rectangle([MARGIN, 102, W - MARGIN, 107], fill=INK)
-    d.rectangle([MARGIN, 111, W - MARGIN, 113], fill=INK)
+    p.rule(102, weight=5)
+    p.rule(111, weight=2)
 
-    # ---- lead panel (118..324) ----
-    lead_top, lead_bot = 118, 324
-    draw_tracked(d, MARGIN, lead_top, "UKRAINE", bold(14), RED, tracking=4)
-    pic_bridges(d, MARGIN, lead_top + 20, CONTENT_W, 56)
-    hy = lead_top + 20 + 56 + 6
-    f_h, h_lines, h_lh, h_h = fit_block(
-        "RUSSIA'S BIGGEST BARRAGE HITS KYIV BRIDGES — AND SPILLS INTO POLAND",
-        BOLD_PATH, 34, 28, CONTENT_W, 76, lh_factor=1.12, max_lines=2)
-    draw_lines(d, MARGIN, hy, h_lines, f_h, h_lh, INK)
-    note("lead headline", (MARGIN, hy, CONTENT_W, 76), h_h, h_lines)
-    cy = hy + h_h + 6
-    f_c, c_lines, c_lh, c_h = fit_block(
-        "More than 400 drones and 110 missiles rain on Ukraine; three "
-        "bridges over the Dnipro are struck, eight people are killed — and "
-        "two Russian missiles land in NATO member Poland.",
-        REG_PATH, 18, 16, CONTENT_W, lead_bot - cy, lh_factor=1.28,
-        max_lines=2)
-    draw_lines(d, MARGIN, cy, c_lines, f_c, c_lh, INK)
-    note("lead caption", (MARGIN, cy, CONTENT_W, lead_bot - cy), c_h, c_lines)
+    # ---- lead: kicker, vignette, headline, deck ----
+    y = 118
+    p.caps(MARGIN, y, "UKRAINE", ty.face(True, 14), SIGNAL_RED)
+    draw_kyiv(p, MARGIN, y + 20, SPAN, 56)
+    y += 20 + 56 + 6
+    face, lines, step = fit_text(
+        ty, "RUSSIA'S BIGGEST BARRAGE HITS KYIV BRIDGES — AND SPILLS INTO "
+            "POLAND", True, 34, 28, SPAN, 76, leading=1.12, limit=2)
+    p.block(MARGIN, y, lines, face, step, INK)
+    p.record("lead headline", 76, step * len(lines), lines)
+    y += step * len(lines) + 6
+    face, lines, step = fit_text(
+        ty, "More than 400 drones and 110 missiles rain on Ukraine; three "
+            "bridges over the Dnipro are struck, eight people are killed — "
+            "and two Russian missiles land in NATO member Poland.",
+        False, 18, 16, SPAN, 324 - y, leading=1.28, limit=2)
+    p.block(MARGIN, y, lines, face, step, INK)
+    p.record("lead caption", 324 - y + 6, step * len(lines), lines)
 
-    # rule under lead
-    d.rectangle([MARGIN, 332, W - MARGIN, 334], fill=INK)
+    p.rule(332, weight=2)
 
-    # ---- 2x2 grid (340..556) ----
+    # ---- four panels in a 2x2 grid ----
     grid_top, grid_bot = 340, 556
-    row_h = (grid_bot - grid_top - 8) // 2  # 104, gap 8 with rule
-    col_w = (CONTENT_W - 28) // 2            # 454, gutter 28
-    col_x = [MARGIN, MARGIN + col_w + 28]
-    row_y = [grid_top, grid_top + row_h + 8]
-    # vertical rule between columns
-    d.line([W // 2, grid_top + 4, W // 2, grid_bot - 4], fill=INK, width=2)
-    # horizontal rule between rows
-    d.rectangle([MARGIN, grid_top + row_h + 3, W - MARGIN,
+    row_h = (grid_bot - grid_top - 8) // 2
+    col_w = (SPAN - 28) // 2
+    d.line([SIDE // 2, grid_top + 4, SIDE // 2, grid_bot - 4], fill=INK,
+           width=2)
+    d.rectangle([MARGIN, grid_top + row_h + 3, SIDE - MARGIN,
                  grid_top + row_h + 5], fill=INK)
 
     panels = [
-        ("GULF", pic_tanker,
+        ("GULF", draw_tanker,
          "TANKERS BURN AS U.S. BLOCKADES HORMUZ",
          "Iran threatens Gulf oil facilities; the IEA calls the disruption "
          "the largest energy shock on record."),
-        ("MARKETS", pic_chart,
+        ("MARKETS", draw_market,
          "AI SELLOFF WIPES $4 TRILLION OFF WALL STREET",
          "KOSPI -4.7%, Nikkei -4.8%, Nasdaq faces its worst November "
          "since 2008."),
-        ("CLIMATE", pic_climate,
+        ("CLIMATE", draw_climate,
          "COP31 DRAFT DENOUNCED AS FOSSIL TALKS STALL",
          "Activists denounce the Antalya draft as negotiators deadlock over "
          "how to address fossil fuels."),
-        ("DIPLOMACY", pic_flags,
+        ("DIPLOMACY", draw_flags,
          "TRUMP DEFENDS HIS PUTIN AND XI TIES",
          "Back in Washington, Trump hails the Shenzhen summit — analysts say "
          "it produced little progress."),
     ]
+    for idx, (kicker, draw, headline, deck) in enumerate(panels):
+        px = MARGIN + (idx % 2) * (col_w + 28)
+        py = grid_top + (idx // 2) * (row_h + 8)
+        p.caps(px, py, kicker, ty.face(True, 12), SIGNAL_RED)
+        top = py + 16
+        room_h = py + row_h - top
+        draw(p, px, top + (room_h - 68) // 2, 68)
+        tx, tw = px + 100, col_w - 100
+        face, lines, step = fit_text(ty, headline, True, 22, 18, tw,
+                                     int(room_h * 0.56), leading=1.14,
+                                     limit=2)
+        p.block(tx, top, lines, face, step, INK)
+        p.record(f"panel {kicker} headline", int(room_h * 0.56),
+                 step * len(lines), lines)
+        cap_y = top + step * len(lines) + 6
+        face, lines, step = fit_text(ty, deck, False, 14, 12, tw,
+                                     py + row_h - cap_y, leading=1.22,
+                                     limit=2)
+        p.block(tx, cap_y, lines, face, step, INK)
+        p.record(f"panel {kicker} caption", py + row_h - cap_y,
+                 step * len(lines), lines)
 
-    for idx, (kicker, pic, headline, caption) in enumerate(panels):
-        px = col_x[idx % 2]
-        py = row_y[idx // 2]
-        draw_tracked(d, px, py, kicker, bold(12), RED, tracking=4)
-        content_top = py + 16
-        avail_h = (py + row_h) - content_top
-        # pictogram on the left, text on the right
-        pic(d, px, content_top + (avail_h - 68) // 2, 68)
-        tx = px + 100
-        tw = col_w - 100
-        # headline gets up to ~55% of the height, caption the rest
-        f_h, h_lines, h_lh, h_h = fit_block(
-            headline, BOLD_PATH, 22, 18, tw, int(avail_h * 0.56),
-            lh_factor=1.14, max_lines=2)
-        draw_lines(d, tx, content_top, h_lines, f_h, h_lh, INK)
-        note(f"panel {kicker} headline", (tx, content_top, tw,
-             int(avail_h * 0.56)), h_h, h_lines)
-        cap_y = content_top + h_h + 6
-        f_c, c_lines, c_lh, c_h = fit_block(
-            caption, REG_PATH, 14, 12, tw, (py + row_h) - cap_y,
-            lh_factor=1.22, max_lines=2)
-        draw_lines(d, tx, cap_y, c_lines, f_c, c_lh, INK)
-        note(f"panel {kicker} caption", (tx, cap_y, tw, (py + row_h) - cap_y),
-             c_h, c_lines)
+    p.rule(564, weight=2)
 
-    # rule under grid
-    d.rectangle([MARGIN, 564, W - MARGIN, 566], fill=INK)
+    # ---- the wire: header, then three balanced columns ----
+    p.text(MARGIN, 572, "THE DAY IN BRIEF · 37 MORE STORIES",
+           ty.face(True, 16), INK)
+    tail = "WIRE · 20 NOV 2026 (UTC)"
+    tf = ty.face(False, 13)
+    p.text(SIDE - MARGIN - ty.measure(tail, tf), 575, tail, tf, DEEP_BLUE)
 
-    # ---- wire section header (572..594) ----
-    wh_f = bold(16)
-    wh_txt = "THE DAY IN BRIEF · 37 MORE STORIES"
-    d.text((MARGIN, 572), wh_txt, font=wh_f, fill=INK)
-    wr_f = regular(13)
-    wr_txt = "WIRE · 20 NOV 2026 (UTC)"
-    d.text((W - MARGIN - text_w(wr_txt, wr_f), 575), wr_txt, font=wr_f,
-           fill=NAVY)
-
-    # ---- wire columns (598..978) ----
     wire_top, wire_bot = 598, 978
     wire_h = wire_bot - wire_top
-    wcol_w = (CONTENT_W - 2 * 16) // 3  # 301
-    wcol_x = [MARGIN, MARGIN + wcol_w + 16, MARGIN + 2 * (wcol_w + 16)]
-    # pick the largest wire size whose tallest balanced column fits
-    chosen = None
+    wcol_w = (SPAN - 2 * 16) // 3
+    wcol_x = [MARGIN + i * (wcol_w + 16) for i in range(3)]
+    picked = None
     for size in (14, 13, 12):
-        wf = regular(size)
-        tf = bold(size)
-        lh = size  # caps-only wire text: tight leading, no descenders
-        wrapped = [wire_wrap(head, tag, wf, wcol_w, tf)
+        wf, tface = ty.face(False, size), ty.face(True, size)
+        wrapped = [wrap_wire(head, tag, wf, tface, wcol_w)
                    for tag, head in WIRE]
-        # longest-first balancing keeps the tallest column minimal
-        wrapped.sort(key=lambda it: -len(it[0]))
+        wrapped.sort(key=lambda item: -len(item[0]))
         cols, heights = [[], [], []], [0, 0, 0]
         for item in wrapped:
             ci = heights.index(min(heights))
             cols[ci].append(item)
             heights[ci] += len(item[0])
-        if max(heights) * lh <= wire_h:
-            chosen = (size, lh, cols, heights)
+        if max(heights) * size <= wire_h:
+            picked = (size, cols, heights)
             break
-    size, lh, cols, heights = chosen
-    wf = regular(size)
-    tf = bold(size)
-    note("wire columns", (MARGIN, wire_top, CONTENT_W, wire_h),
-         max(heights) * lh, [f"size={size} lines={heights}"])
+    size, cols, heights = picked
+    wf, tface = ty.face(False, size), ty.face(True, size)
+    p.record("wire columns", wire_h, max(heights) * size,
+             [f"size={size} lines={heights}"])
     for ci, items in enumerate(cols):
         cy = wire_top
         for lines, tag_w, tag in items:
-            d.text((wcol_x[ci], cy), tag, font=tf, fill=RED)
+            p.text(wcol_x[ci], cy, tag, tface, SIGNAL_RED)
             for li, line in enumerate(lines):
                 lx = wcol_x[ci] + (tag_w if li == 0 else 0)
-                d.text((lx, cy), line, font=wf, fill=INK)
-                cy += lh
+                p.text(lx, cy, line, wf, INK)
+                cy += size
 
-    # ---- footer band (986..1024) ----
-    d.rectangle([0, 986, W, H], fill=NAVY)
-    footer = ("ALSO TODAY · GTA VI banks nearly $4B on launch day · "
-              "Van Gogh fetches a record $190.4M · Fiona the hippo dies "
-              "at her U.S. zoo")
-    f_f, f_lines, f_lh, f_h = fit_block(
-        footer, REG_PATH, 14, 12, CONTENT_W, 34, lh_factor=1.22, max_lines=2)
-    fy = 986 + (38 - f_h) // 2
-    draw_lines(d, MARGIN, fy, f_lines, f_f, f_lh, WHITE)
-    note("footer", (MARGIN, 986, CONTENT_W, 38), f_h, f_lines)
+    # ---- footer band: three highlights on navy ----
+    d.rectangle([0, 986, SIDE, SIDE], fill=DEEP_BLUE)
+    face, lines, step = fit_text(
+        ty, "ALSO TODAY · GTA VI banks nearly $4B on launch day · "
+            "Van Gogh fetches a record $190.4M · Fiona the hippo dies "
+            "at her U.S. zoo",
+        False, 14, 12, SPAN, 34, leading=1.22, limit=2)
+    p.block(MARGIN, 986 + (38 - step * len(lines)) // 2, lines, face, step,
+            SNOW)
+    p.record("footer", 38, step * len(lines), lines)
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    img.save(OUT, format="PNG", optimize=True)
-    img.save(LOCAL, format="PNG", optimize=True)
-    size = os.path.getsize(OUT)
-    print(f"saved {OUT}: {img.size[0]}x{img.size[1]}, {size} bytes")
-    print("--- layout measurements (box -> used) ---")
-    for name, (bx, by, bw, bh), used, lines in REPORT:
-        flag = "OK " if used <= bh else "OVERFLOW"
-        print(f"{flag} {name}: box h={bh} used h={used} lines={lines}")
+    p.save()
 
 
 if __name__ == "__main__":
-    main()
+    build()
